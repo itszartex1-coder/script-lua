@@ -1,5 +1,5 @@
 --[[
-    MONO AIM v3.6 | ESCANEO MANUAL DE COMPAÑEROS, SIN BUCLES AUTOMATICOS
+    MONO AIM v3.7 | PAREDES MEJORADAS + ESCANEO MANUAL DE COMPAÑEROS
     TIPO: Script NORMAL de Roblox; no es un LocalScript.
     UBICACION: StarterPlayer > StarterPlayerScripts
     IMPORTANTE: en Properties, configurar RunContext = Client.
@@ -34,7 +34,7 @@ local CONFIG = {
     ARROW_DEBUG = false, -- true: imprime nuevos aliados en Output
     WALL_PASS_TAG = "MonoPassWall",  -- etiqueta opcional para muros especiales
     WALL_RADIUS = 10,              -- estudia muros proximos al jugador
-    WALL_SCAN_INTERVAL = 0.18,     -- colisiones ~5-6 veces/s, evita sobrecargar CPU
+    WALL_SCAN_INTERVAL = 0.075,    -- respuesta mas rapida (~13 consultas/s)
     MAX_DISTANCE = 700,          -- studs
     ACQUIRE_FOV = 290,          -- pixeles alrededor de la mira
     KEEP_FOV_MULTIPLIER = 1.65, -- evita saltos entre objetivos
@@ -155,7 +155,7 @@ create("TextLabel", {
     Size = UDim2.fromOffset(270, 17),
     BackgroundTransparency = 1,
     Font = Enum.Font.Gotham,
-    Text = "PANEL DE CONTROL  •  V3.6",
+    Text = "PANEL DE CONTROL  •  V3.7",
     TextSize = 11,
     TextColor3 = COLORS.muted,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -271,7 +271,7 @@ end
 createRow("aimlock", 144, "AIM LOCK", "Sigue un objetivo fijo")
 createRow("aimbot", 238, "AIMBOT", "Apuntado rapido y objetivo estable")
 createRow("esp", 332, "ESP", "Silueta verde sin recuadro")
-createRow("wallpass", 426, "PAREDES", "Atraviesa muros sin quitar colision al suelo")
+createRow("wallpass", 426, "PAREDES", "Pasa estructuras y muros; protege el suelo")
 local status = create("TextLabel", {
     Name = "Estado",
     Position = UDim2.fromOffset(18, 568),
@@ -1109,57 +1109,107 @@ local function runManualAllyScan()
 end
 rescanAllies.Activated:Connect(runManualAllyScan)
 
---==================== ATRAVESAR PAREDES ====================--
--- El cliente desactiva la colision solo en muros cercanos, NO en el suelo.
--- Las paredes normales se detectan por forma; para MeshParts/estructuras
--- especiales, usa el tag MonoPassWall o atributo MonoWallPass=true.
--- Es local al jugador; un anticheat/servidor autoritativo puede impedirlo.
+--==================== ATRAVESAR PAREDES (MEJORADO) ====================--
+-- Escanea el volumen del cuerpo, un poco por delante del movimiento, en vez
+-- de revisar un radio con un maximo de 125 piezas y filtrar solo muros delgados.
+-- Conserva las colisiones desactivadas hasta salir completamente del obstaculo.
+-- No altera el Terrain ni piezas que actuan como suelo.
+-- IMPORTANTE: una estructura con suelo y paredes en el MISMO MeshPart/Union
+-- no puede atravesarse parcialmente: hay que dividir esa pieza en Studio.
+-- Sigue siendo local: si el servidor controla el movimiento puede corregirlo.
 local wallParams = OverlapParams.new()
 wallParams.FilterType = Enum.RaycastFilterType.Exclude
-wallParams.MaxParts = 125
-local ghostWalls = {} -- [BasePart] = CanCollide original
+wallParams.RespectCanCollide = true
+wallParams.MaxParts = 450 -- limite de seguridad en mapas muy densos
+
+local floorRayParams = RaycastParams.new()
+floorRayParams.FilterType = Enum.RaycastFilterType.Exclude
+floorRayParams.RespectCanCollide = true
+floorRayParams.IgnoreWater = false
+
+local ghostWalls = {} -- [BasePart] = valor original de CanCollide
+local FLOOR_WORDS = {
+    "floor", "ground", "baseplate", "suelo", "piso", "stairs",
+    "escalera", "ramp", "techo", "roof", "platform", "plataforma",
+}
+
 local function restoreWalls()
     for part, original in pairs(ghostWalls) do
         ghostWalls[part] = nil
-        if part and part.Parent then
-            part.CanCollide = original
+        if part.Parent then part.CanCollide = original end
+    end
+end
+
+-- Distancia al limite de la pieza (no a su centro). Evita restaurar una
+-- pared grande cuando el jugador sigue dentro de ella.
+local function wallDistanceToPoint(part, point)
+    local p = part.CFrame:PointToObjectSpace(point)
+    local h = part.Size * 0.5
+    local x = math.max(math.abs(p.X) - h.X, 0)
+    local y = math.max(math.abs(p.Y) - h.Y, 0)
+    local z = math.max(math.abs(p.Z) - h.Z, 0)
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+-- Recoge las superficies de apoyo reales, incluso plataformas gruesas y
+-- MeshParts cuyo nombre no contiene "floor". Tres rayos reducen el coste.
+local function currentFloorParts(character, root)
+    floorRayParams.FilterDescendantsInstances = {character}
+    local up = Vector3.new(0, 0.6, 0)
+    local down = Vector3.new(0, -7.5, 0)
+    local side = root.CFrame.RightVector * 1.1
+    local supports = {}
+    for _, offset in ipairs({Vector3.zero, side, -side}) do
+        local hit = Workspace:Raycast(root.Position + up + offset, down, floorRayParams)
+        if hit and hit.Instance:IsA("BasePart") and hit.Normal.Y >= 0.65 then
+            supports[hit.Instance] = true
         end
     end
+    return supports
 end
-local function shouldPassWall(part)
-    if not part:IsA("BasePart") then return false end
-    if not part.CanCollide and ghostWalls[part] == nil then return false end
-    -- Nunca modificar personajes (nuestro jugador, otros jugadores, NPCs).
-    local model = part:FindFirstAncestorOfClass("Model")
-    if model and model:FindFirstChildOfClass("Humanoid") then return false end
-    local name = string.lower(part.Name)
-    if string.find(name, "floor", 1, true)
-        or string.find(name, "ground", 1, true)
-        or string.find(name, "baseplate", 1, true)
-        or string.find(name, "suelo", 1, true)
-        or string.find(name, "piso", 1, true)
-        or string.find(name, "stairs", 1, true)
-        or string.find(name, "escalera", 1, true)
-        or string.find(name, "ramp", 1, true)
-        or string.find(name, "techo", 1, true)
-        or string.find(name, "roof", 1, true) then
-        return false
-    end
-    if CollectionService:HasTag(part, CONFIG.WALL_PASS_TAG)
-        or part:GetAttribute("MonoWallPass") == true then
+
+local function isFloorPiece(part, supports)
+    -- Las etiquetas de suelo siempre tienen prioridad para no caerse.
+    if CollectionService:HasTag(part, "MonoFloor")
+        or part:GetAttribute("MonoFloor") == true
+        or part:GetAttribute("IsFloor") == true
+        or supports[part] then
         return true
     end
-    -- Deteccion automatica conservadora: muro vertical, alto y delgado.
-    -- Si tu mapa utiliza muros gruesos o meshes irregulares, etiquetalos.
-    if not part.Anchored then return false end
-    local sz = part.Size
-    if sz.Y < 3 or math.abs(part.CFrame.UpVector.Y) < 0.75 then return false end
-    local narrow = math.min(sz.X, sz.Z)
-    local long = math.max(sz.X, sz.Z)
-    return narrow <= 3.5 and long >= 3.0
+    -- Permite indicar expresamente estructuras atravesables.
+    if CollectionService:HasTag(part, CONFIG.WALL_PASS_TAG)
+        or part:GetAttribute("MonoWallPass") == true then
+        return false
+    end
+    local name = string.lower(part.Name)
+    for _, word in ipairs(FLOOR_WORDS) do
+        if string.find(name, word, 1, true) then return true end
+    end
+    -- Placas horizontales: pisos, techos y plataformas pequeñas, aunque
+    -- se llamen "Part". Las paredes verticales no cumplen esta geometria.
+    local size = part.Size
+    if math.abs(part.CFrame.UpVector.Y) >= 0.85
+        and size.Y <= 2.2 and size.X >= 0.85 and size.Z >= 0.85 then
+        return true
+    end
+    return false
 end
+
+local function canGhostStructure(part, character, supports)
+    if not part:IsA("BasePart") or part:IsDescendantOf(character) then
+        return false
+    end
+    if not part.CanCollide and ghostWalls[part] == nil then return false end
+    -- Excluye personajes, sus accesorios y herramientas, pero permite
+    -- puertas, cristales, muros gruesos, modelos, MeshParts y piezas movibles.
+    if part:FindFirstAncestorOfClass("Tool") then return false end
+    local model = part:FindFirstAncestorOfClass("Model")
+    if model and model:FindFirstChildOfClass("Humanoid") then return false end
+    return not isFloorPiece(part, supports)
+end
+
 local function refreshWallPass()
-    if not enabled.wallpass then return end
+    if not enabled.wallpass or stopped then return end
     local character = localPlayer.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -1167,22 +1217,54 @@ local function refreshWallPass()
         restoreWalls()
         return
     end
+
     wallParams.FilterDescendantsInstances = {character}
-    local near = Workspace:GetPartBoundsInRadius(root.Position, CONFIG.WALL_RADIUS, wallParams)
-    local visible = {}
-    for _, part in ipairs(near) do
-        if shouldPassWall(part) then
-            visible[part] = true
-            if ghostWalls[part] == nil then
-                ghostWalls[part] = part.CanCollide
-            end
+    local supports = currentFloorParts(character, root)
+    local direction = humanoid.MoveDirection
+    if direction.Magnitude < 0.05 then
+        local velocity = root.AssemblyLinearVelocity
+        direction = Vector3.new(velocity.X, 0, velocity.Z)
+    end
+    direction = Vector3.new(direction.X, 0, direction.Z)
+    if direction.Magnitude > 0.05 then direction = direction.Unit end
+
+    -- Busqueda alrededor de todo el avatar + margen en la direccion de marcha.
+    local center = root.Position + Vector3.new(0, 0.7, 0) + direction * 2.3
+    local searchBox = Vector3.new(12, 7.4, 12)
+    local nearby = Workspace:GetPartBoundsInBox(CFrame.new(center), searchBox, wallParams)
+
+    -- En mapas muy densos el limite de resultados puede ocultar una pared.
+    -- Una segunda consulta pequeña cubre el cuerpo sin escanear todo el mapa.
+    if #nearby >= wallParams.MaxParts then
+        local atBody = Workspace:GetPartBoundsInBox(
+            CFrame.new(root.Position + Vector3.new(0, 0.5, 0)),
+            Vector3.new(5.5, 6.5, 5.5), wallParams
+        )
+        for _, part in ipairs(atBody) do table.insert(nearby, part) end
+    end
+
+    for _, part in ipairs(nearby) do
+        if canGhostStructure(part, character, supports) then
+            if ghostWalls[part] == nil then ghostWalls[part] = part.CanCollide end
             part.CanCollide = false
         end
     end
+
     for part, original in pairs(ghostWalls) do
-        if not visible[part] then
+        if not part.Parent then
             ghostWalls[part] = nil
-            if part.Parent then part.CanCollide = original end
+        elseif supports[part] then
+            -- Nunca dejar una superficie de apoyo sin colision.
+            part.CanCollide = original
+            ghostWalls[part] = nil
+        elseif wallDistanceToPoint(part, root.Position) > 8 then
+            -- Solo restaurar cuando el cuerpo esta realmente fuera.
+            part.CanCollide = original
+            ghostWalls[part] = nil
+        else
+            -- Mantener atravesable aunque una consulta no devuelva la pieza
+            -- (por limites, streaming o porque CanCollide ya es false).
+            part.CanCollide = false
         end
     end
 end
@@ -1475,5 +1557,5 @@ local function shutdownMonoAim()
 end
 closeMonoAim.Activated:Connect(shutdownMonoAim)
 
-print("MONO AIM V3.6 listo | Q Aim Lock / E Aimbot / R ESP / T Paredes / Y Actualizar aliados MANUAL")
+print("MONO AIM V3.7 listo | Q Aim Lock / E Aimbot / R ESP / T Paredes / Y Actualizar aliados MANUAL")
 
