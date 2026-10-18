@@ -1,5 +1,5 @@
 --[[
-    MONO AIM v3.7 | PAREDES MEJORADAS + ESCANEO MANUAL DE COMPAÑEROS
+    MONO AIM v3.8 | PAREDES INVISIBLES + ESCANEO MANUAL DE COMPAÑEROS
     TIPO: Script NORMAL de Roblox; no es un LocalScript.
     UBICACION: StarterPlayer > StarterPlayerScripts
     IMPORTANTE: en Properties, configurar RunContext = Client.
@@ -155,7 +155,7 @@ create("TextLabel", {
     Size = UDim2.fromOffset(270, 17),
     BackgroundTransparency = 1,
     Font = Enum.Font.Gotham,
-    Text = "PANEL DE CONTROL  •  V3.7",
+    Text = "PANEL DE CONTROL  •  V3.8",
     TextSize = 11,
     TextColor3 = COLORS.muted,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -1109,7 +1109,7 @@ local function runManualAllyScan()
 end
 rescanAllies.Activated:Connect(runManualAllyScan)
 
---==================== ATRAVESAR PAREDES (MEJORADO) ====================--
+--==================== ATRAVESAR PAREDES (V3.8 INVISIBLES) ====================--
 -- Escanea el volumen del cuerpo, un poco por delante del movimiento, en vez
 -- de revisar un radio con un maximo de 125 piezas y filtrar solo muros delgados.
 -- Conserva las colisiones desactivadas hasta salir completamente del obstaculo.
@@ -1122,12 +1122,30 @@ wallParams.FilterType = Enum.RaycastFilterType.Exclude
 wallParams.RespectCanCollide = true
 wallParams.MaxParts = 450 -- limite de seguridad en mapas muy densos
 
+-- Segunda deteccion con rayos horizontales. Encuentra barreras transparentes
+-- o grandes que las consultas volumetricas pueden pasar por alto.
+local forwardWallRay = RaycastParams.new()
+forwardWallRay.FilterType = Enum.RaycastFilterType.Exclude
+forwardWallRay.RespectCanCollide = true
+forwardWallRay.IgnoreWater = true
+
 local floorRayParams = RaycastParams.new()
 floorRayParams.FilterType = Enum.RaycastFilterType.Exclude
 floorRayParams.RespectCanCollide = true
 floorRayParams.IgnoreWater = false
 
 local ghostWalls = {} -- [BasePart] = valor original de CanCollide
+local function playerCollisionGroup(character, root)
+    -- El HumanoidRootPart a menudo no colisiona: buscar una parte corporal
+    -- que si lo haga para consultar el mismo grupo de colision.
+    for _, name in ipairs({"LowerTorso", "Torso", "UpperTorso"}) do
+        local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart") and part.CanCollide then
+            return part.CollisionGroup
+        end
+    end
+    return root.CollisionGroup
+end
 local FLOOR_WORDS = {
     "floor", "ground", "baseplate", "suelo", "piso", "stairs",
     "escalera", "ramp", "techo", "roof", "platform", "plataforma",
@@ -1208,6 +1226,37 @@ local function canGhostStructure(part, character, supports)
     return not isFloorPiece(part, supports)
 end
 
+-- La transparencia no significa que una barrera carezca de colision:
+-- una pared 100% invisible con CanCollide=true sigue bloqueando al avatar.
+local function ghostPart(part, character, supports)
+    if not part or not canGhostStructure(part, character, supports) then
+        return
+    end
+    if ghostWalls[part] == nil then ghostWalls[part] = part.CanCollide end
+    part.CanCollide = false
+end
+
+local function detectForwardBarriers(character, root, direction, supports)
+    if direction.Magnitude <= 0.05 then return end
+    forwardWallRay.FilterDescendantsInstances = {character}
+    local forward = direction.Unit * 9
+    local right = root.CFrame.RightVector
+    -- Distintas alturas y lados para detectar un muro aunque su centro,
+    -- bounding box o geometria invisible no coincidan con una sola muestra.
+    local origins = {
+        root.Position + Vector3.new(0, 1.5, 0),
+        root.Position + Vector3.new(0, -0.45, 0) + right * 0.75,
+        root.Position + Vector3.new(0, 0.45, 0) - right * 0.75,
+    }
+    for _, origin in ipairs(origins) do
+        local hit = Workspace:Raycast(origin, forward, forwardWallRay)
+        if hit and hit.Instance:IsA("BasePart")
+            and math.abs(hit.Normal.Y) < 0.7 then
+            ghostPart(hit.Instance, character, supports)
+        end
+    end
+end
+
 local function refreshWallPass()
     if not enabled.wallpass or stopped then return end
     local character = localPlayer.Character
@@ -1218,6 +1267,12 @@ local function refreshWallPass()
         return
     end
 
+    -- Consultas con el grupo de colision que realmente utiliza el avatar.
+    -- Algunas barreras invisibles usan grupos distintos del grupo Default.
+    local collisionGroup = playerCollisionGroup(character, root)
+    wallParams.CollisionGroup = collisionGroup
+    forwardWallRay.CollisionGroup = collisionGroup
+    floorRayParams.CollisionGroup = collisionGroup
     wallParams.FilterDescendantsInstances = {character}
     local supports = currentFloorParts(character, root)
     local direction = humanoid.MoveDirection
@@ -1228,9 +1283,13 @@ local function refreshWallPass()
     direction = Vector3.new(direction.X, 0, direction.Z)
     if direction.Magnitude > 0.05 then direction = direction.Unit end
 
+    -- Detectar primero barreras frontales, incluyendo paredes invisibles.
+    -- Esta busqueda no recorre el mapa completo.
+    detectForwardBarriers(character, root, direction, supports)
+
     -- Busqueda alrededor de todo el avatar + margen en la direccion de marcha.
-    local center = root.Position + Vector3.new(0, 0.7, 0) + direction * 2.3
-    local searchBox = Vector3.new(12, 7.4, 12)
+    local center = root.Position + Vector3.new(0, 0.7, 0) + direction * 3.4
+    local searchBox = Vector3.new(15, 8.2, 15)
     local nearby = Workspace:GetPartBoundsInBox(CFrame.new(center), searchBox, wallParams)
 
     -- En mapas muy densos el limite de resultados puede ocultar una pared.
@@ -1244,10 +1303,7 @@ local function refreshWallPass()
     end
 
     for _, part in ipairs(nearby) do
-        if canGhostStructure(part, character, supports) then
-            if ghostWalls[part] == nil then ghostWalls[part] = part.CanCollide end
-            part.CanCollide = false
-        end
+        ghostPart(part, character, supports)
     end
 
     for part, original in pairs(ghostWalls) do
@@ -1557,5 +1613,5 @@ local function shutdownMonoAim()
 end
 closeMonoAim.Activated:Connect(shutdownMonoAim)
 
-print("MONO AIM V3.7 listo | Q Aim Lock / E Aimbot / R ESP / T Paredes / Y Actualizar aliados MANUAL")
+print("MONO AIM V3.8 listo | Q Aim Lock / E Aimbot / R ESP / T Paredes / Y Actualizar aliados MANUAL")
 
