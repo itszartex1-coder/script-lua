@@ -68,6 +68,9 @@ local lockedTarget = nil
 local tracked = {}
 local highlights = {}
 local awaitingBind = nil
+-- Conexiones de los servicios que deben desconectarse al cerrar.
+local stopped = false
+local serviceConnections = {}
 --==================== LIMPIEZA BASICA ====================--
 local oldUI = playerGui:FindFirstChild("MonoAimV36_UI")
 if oldUI then oldUI:Destroy() end
@@ -159,7 +162,7 @@ create("TextLabel", {
 }, header)
 local minimize = create("TextButton", {
     Name = "Minimizar",
-    Position = UDim2.fromOffset(329, 22),
+    Position = UDim2.fromOffset(282, 22),
     Size = UDim2.fromOffset(39, 34),
     Text = "−",
     TextSize = 24,
@@ -170,6 +173,20 @@ local minimize = create("TextButton", {
     AutoButtonColor = false,
 }, header)
 corners(minimize, 9)
+-- X: cierra la interfaz y detiene esta ejecucion completamente.
+local closeMonoAim = create("TextButton", {
+    Name = "CerrarYApagar",
+    Position = UDim2.fromOffset(329, 22),
+    Size = UDim2.fromOffset(39, 34),
+    Text = "X",
+    TextSize = 16,
+    Font = Enum.Font.GothamBold,
+    TextColor3 = COLORS.white,
+    BackgroundColor3 = COLORS.off,
+    BorderSizePixel = 0,
+    AutoButtonColor = true,
+}, header)
+corners(closeMonoAim, 9)
 create("TextLabel", {
     Position = UDim2.fromOffset(18, 95),
     Size = UDim2.fromOffset(348, 20),
@@ -446,6 +463,7 @@ outline(notification, Color3.fromRGB(85, 87, 92), 1)
 local notificationSequence = 0
 local notificationTween = nil
 local function showNotification(message)
+    if stopped then return end
     notificationSequence += 1
     local thisSequence = notificationSequence
     if notificationTween then notificationTween:Cancel() end
@@ -462,7 +480,7 @@ local function showNotification(message)
         })
     notificationTween:Play()
     task.delay(1, function()
-        if thisSequence ~= notificationSequence or not notification.Parent then return end
+        if stopped or thisSequence ~= notificationSequence or not notification.Parent then return end
         notificationTween = TweenService:Create(notification,
             TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
                 TextTransparency = 1,
@@ -508,7 +526,7 @@ local function enableDrag(handle, element)
 end
 enableDrag(header, panel)
 enableDrag(bubble, bubble)
-UserInputService.InputChanged:Connect(function(input)
+local dragChangedConnection = UserInputService.InputChanged:Connect(function(input)
     local drag = dragState
     if not drag then return end
     if drag.touch then
@@ -529,13 +547,15 @@ UserInputService.InputChanged:Connect(function(input)
         math.clamp(drag.original.Y + delta.Y, 0, math.max(0, sz.Y - objSize.Y))
     )
 end)
-UserInputService.InputEnded:Connect(function(input)
+table.insert(serviceConnections, dragChangedConnection)
+local dragEndedConnection = UserInputService.InputEnded:Connect(function(input)
     local drag = dragState
     if drag and ((drag.touch and input == drag.touch)
         or (not drag.touch and input.UserInputType == Enum.UserInputType.MouseButton1)) then
         dragState = nil
     end
 end)
+table.insert(serviceConnections, dragEndedConnection)
 minimize.Activated:Connect(function()
     bubble.Position = UDim2.fromOffset(panel.AbsolutePosition.X, panel.AbsolutePosition.Y)
     panel.Visible = false
@@ -734,6 +754,7 @@ local function rebuildGuiIndex()
     table.clear(indexedScreenMarkers)
     local descendants = playerGui:GetDescendants()
     for i, obj in ipairs(descendants) do
+        if stopped then return end
         if obj:IsA("BillboardGui") then
             table.insert(indexedBillboards, obj)
         elseif obj:IsA("ImageLabel") or obj:IsA("ImageButton")
@@ -978,8 +999,8 @@ local function untrackPlayer(player)
     dropTarget(player)
     refreshAllyList()
 end
-Players.PlayerAdded:Connect(trackPlayer)
-Players.PlayerRemoving:Connect(untrackPlayer)
+table.insert(serviceConnections, Players.PlayerAdded:Connect(trackPlayer))
+table.insert(serviceConnections, Players.PlayerRemoving:Connect(untrackPlayer))
 for _, player in ipairs(Players:GetPlayers()) do
     trackPlayer(player)
 end
@@ -1023,16 +1044,17 @@ local function myTeamChanged()
     if enabled.esp then refreshESP() end
 end
 for _, property in ipairs({"Team", "TeamColor", "Neutral"}) do
-    localPlayer:GetPropertyChangedSignal(property):Connect(myTeamChanged)
+    table.insert(serviceConnections, localPlayer:GetPropertyChangedSignal(property):Connect(myTeamChanged))
 end
 if CONFIG.CUSTOM_TEAM_ATTRIBUTE and CONFIG.CUSTOM_TEAM_ATTRIBUTE ~= "" then
-    localPlayer:GetAttributeChangedSignal(CONFIG.CUSTOM_TEAM_ATTRIBUTE):Connect(myTeamChanged)
+    table.insert(serviceConnections, localPlayer:GetAttributeChangedSignal(CONFIG.CUSTOM_TEAM_ATTRIBUTE):Connect(myTeamChanged))
 end
 --==================== ACTUALIZACION MANUAL DE COMPAÑEROS ====================--
 -- Ni temporizadores ni inspecciones de flechas durante apuntado o ESP.
 -- Solo una pulsacion de Y (configurable) o del boton "ACTUALIZAR ALIADOS".
 local manualScanBusy = false
 local function runManualAllyScan()
+    if stopped then return end
     if manualScanBusy then
         showNotification("Actualización ya en curso")
         return
@@ -1047,7 +1069,9 @@ local function runManualAllyScan()
         -- desaparece durante la revision y provoca un error de lectura.
         local ok, err = pcall(function()
             rebuildGuiIndex()
+            if stopped then return end
             for _, other in ipairs(Players:GetPlayers()) do
+                if stopped then return end
                 if other ~= localPlayer and tracked[other] and other.Character
                     and not arrowAllies[other] and not forcedEnemies[other]
                     and not isNativeAlly(other) then
@@ -1064,12 +1088,14 @@ local function runManualAllyScan()
                     task.wait() -- cede un fotograma entre jugadores
                 end
             end
+            if stopped then return end
             refreshAllyList()
             if enabled.esp then refreshESP() end
         end)
         table.clear(indexedBillboards)
         table.clear(indexedScreenMarkers)
         manualScanBusy = false
+        if stopped then return end
         if rescanAllies.Parent then rescanAllies.Text = "ACTUALIZAR ALIADOS" end
         if not ok then
             warn("[MONO AIM] Error de actualizacion manual:", err)
@@ -1160,7 +1186,7 @@ local function refreshWallPass()
         end
     end
 end
-localPlayer.CharacterRemoving:Connect(restoreWalls)
+table.insert(serviceConnections, localPlayer.CharacterRemoving:Connect(restoreWalls))
 --==================== APLICACION AIM ====================--
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -1297,7 +1323,7 @@ local INVALID_KEYS = {
     [Enum.KeyCode.RightAlt] = true,
     [Enum.KeyCode.CapsLock] = true,
 }
-UserInputService.InputBegan:Connect(function(input, processed)
+local hotkeyConnection = UserInputService.InputBegan:Connect(function(input, processed)
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
     local key = input.KeyCode
     if awaitingBind then
@@ -1338,6 +1364,7 @@ UserInputService.InputBegan:Connect(function(input, processed)
         end
     end
 end)
+table.insert(serviceConnections, hotkeyConnection)
 refreshButtons()
 --==================== ACTUALIZACIONES EN CLIENTE ====================--
 local renderName = "MonoAimV36_Camera_" .. localPlayer.UserId
@@ -1383,7 +1410,7 @@ RunService:BindToRenderStep(renderName, Enum.RenderPriority.Camera.Value + 1, fu
 end)
 local lastEspCheck = 0
 local lastWallCheck = 0
-RunService.Heartbeat:Connect(function(dt)
+local heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
     if enabled.esp then
         lastEspCheck += dt
         if lastEspCheck >= CONFIG.ESP_REFRESH_INTERVAL then
@@ -1403,5 +1430,50 @@ RunService.Heartbeat:Connect(function(dt)
         lastWallCheck = 0
     end
 end)
+table.insert(serviceConnections, heartbeatConnection)
+
+--==================== APAGADO COMPLETO ====================--
+local function shutdownMonoAim()
+    if stopped then return end
+    stopped = true -- evita iniciar tareas o avisos nuevos
+    for name in pairs(enabled) do
+        enabled[name] = false
+    end
+    lockedTarget = nil
+    awaitingBind = nil
+    manualScanBusy = false
+    dragState = nil
+
+    -- Detener camara, actualizacion de ESP, wallpass y entradas.
+    RunService:UnbindFromRenderStep(renderName)
+    for _, connection in ipairs(serviceConnections) do
+        connection:Disconnect()
+    end
+    table.clear(serviceConnections)
+
+    -- Desconectar vida, respawns, equipos y jugadores.
+    for player, record in pairs(tracked) do
+        disconnectAll(record.characterConnections)
+        disconnectAll(record.playerConnections)
+        tracked[player] = nil
+    end
+
+    -- Restablecer todas las colisiones y eliminar efectos visuales.
+    restoreWalls()
+    clearESP()
+    table.clear(arrowAllies)
+    table.clear(forcedEnemies)
+    table.clear(indexedBillboards)
+    table.clear(indexedScreenMarkers)
+    notificationSequence += 1
+    if notificationTween then
+        notificationTween:Cancel()
+        notificationTween = nil
+    end
+    if highlightFolder.Parent then highlightFolder:Destroy() end
+    if gui.Parent then gui:Destroy() end
+end
+closeMonoAim.Activated:Connect(shutdownMonoAim)
+
 print("MONO AIM V3.6 listo | Q Aim Lock / E Aimbot / R ESP / T Paredes / Y Actualizar aliados MANUAL")
 
